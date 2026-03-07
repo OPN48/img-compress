@@ -9,6 +9,8 @@
 #include <QSysInfo>
 #include <QTemporaryFile>
 #include <QScopedPointer>
+#include <QCryptographicHash>
+#include <QImageReader>
 
 namespace {
 const int kProcessTimeoutMs = 180000;
@@ -294,7 +296,10 @@ CompressionResult EngineRegistry::compressFile(
     const QString &output,
     const CompressionOptions &options
 ) {
-    const QString suffix = normalizeSuffix(QFileInfo(source).suffix().toLower());
+    const QString suffixFromName = normalizeSuffix(QFileInfo(source).suffix().toLower());
+    const QByteArray detected = QImageReader::imageFormat(source);
+    const QString actualSuffix = normalizeSuffix(QString::fromLatin1(detected).toLower());
+    const QString suffix = actualSuffix.isEmpty() ? suffixFromName : actualSuffix;
     const qint64 originalSize = QFileInfo(source).size();
     const QString outputFormat = normalizeSuffix(options.outputFormat.toLower());
     if (outputFormat == "gif" && suffix != "gif") {
@@ -420,6 +425,55 @@ CompressionResult EngineRegistry::compressFile(
             if (!ok && isSameFormat(outputFormat, suffix) && isCorruptedInput(res.second)) {
                 return keepOriginal(source, output, "源文件异常，已保留原图");
             }
+            if (ok && outputSize >= originalSize) {
+                if (detectPlatform() == "windows") {
+                    const QString jpegoptim = findTool({"jpegoptim"});
+                    if (!jpegoptim.isEmpty()) {
+                        const QStringList optArgs = {"--strip-all", "--all-progressive", output};
+                        const auto optRes = runProcessWithCode(jpegoptim, optArgs);
+                        if (optRes.first == 0) {
+                            const qint64 newSize = QFileInfo(output).size();
+                            if (newSize < outputSize) {
+                                return {true, originalSize, newSize, "jpegoptim", "成功（Windows兜底）"};
+                            }
+                        }
+                    }
+                }
+                QFile srcFile(source);
+                QFile outFile(output);
+                QByteArray srcHash;
+                QByteArray outHash;
+                if (srcFile.open(QIODevice::ReadOnly)) {
+                    QCryptographicHash h(QCryptographicHash::Sha1);
+                    while (!srcFile.atEnd()) {
+                        h.addData(srcFile.read(1 << 16));
+                    }
+                    srcHash = h.result();
+                    srcFile.close();
+                }
+                if (outFile.open(QIODevice::ReadOnly)) {
+                    QCryptographicHash h(QCryptographicHash::Sha1);
+                    while (!outFile.atEnd()) {
+                        h.addData(outFile.read(1 << 16));
+                    }
+                    outHash = h.result();
+                    outFile.close();
+                }
+                const QString tail = res.second.trimmed();
+                if (!srcHash.isEmpty() && !outHash.isEmpty() && srcHash == outHash) {
+                    QString msg = "无损无收益（图像未变化）";
+                    if (!tail.isEmpty()) {
+                        msg = QString("%1：%2").arg(msg, tail);
+                    }
+                    return {true, originalSize, outputSize, "jpegtran", msg};
+                } else {
+                    QString msg = "已优化但无体积收益";
+                    if (!tail.isEmpty()) {
+                        msg = QString("%1：%2").arg(msg, tail);
+                    }
+                    return {true, originalSize, outputSize, "jpegtran", msg};
+                }
+            }
             return {ok, originalSize, outputSize, "jpegtran", ok ? "成功" : "失败"};
         }
         const QString cjpeg = findTool({"cjpeg", "mozjpeg"});
@@ -463,8 +517,7 @@ CompressionResult EngineRegistry::compressFile(
                     QString::number(settings.second),
                     "--strip",
                     "--skip-if-larger",
-                    "--output",
-                    output,
+                    "--output", output,
                     "--force",
                     source
                 };
@@ -498,8 +551,12 @@ CompressionResult EngineRegistry::compressFile(
         QStringList args;
         const QString normalized = normalizeProfile(options.profile);
         if (!optimizer.isEmpty()) {
-            const QString level = normalized == "strong" ? "3" : (normalized == "balanced" ? "2" : "1");
-            args = {"-o", level, "--strip", "safe", "--out", output, source};
+                const QString level = normalized == "strong" ? "3" : (normalized == "balanced" ? "2" : "1");
+                if (source == output) {
+                    args = {"-o", level, "--strip", "safe", source};
+                } else {
+                    args = {"-o", level, "--strip", "safe", "--out", output, source};
+                }
             const auto res = runProcessWithCode(optimizer, args);
             const bool ok = res.first == 0;
             const qint64 outputSize = QFileInfo(output).size();
@@ -519,7 +576,11 @@ CompressionResult EngineRegistry::compressFile(
         if (detectPlatform() == "windows") {
             optimizer = findTool({"optipng"});
             if (!optimizer.isEmpty()) {
-                args = {"-o7", "-strip", "all", "-out", output, source};
+                    if (source == output) {
+                        args = {"-o7", "-strip", "all", source};
+                    } else {
+                        args = {"-o7", "-strip", "all", "-out", output, source};
+                    }
                 const auto res = runProcessWithCode(optimizer, args);
                 const bool ok = res.first == 0;
                 const qint64 outputSize = QFileInfo(output).size();
