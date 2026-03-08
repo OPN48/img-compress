@@ -9,6 +9,7 @@ struct CompressionOptions {
     int quality;
     QString profile;
     QString outputFormat;
+    int concurrency;
     bool resizeEnabled;
     int targetWidth;
     int targetHeight;
@@ -26,6 +27,7 @@ struct CompressionResult {
 class EngineRegistry {
 public:
     static QStringList availableEngines();
+    static bool toolExists(const QString &name);
     static QString engineStatus(bool lossless);
     static CompressionResult compressFile(
         const QString &source,

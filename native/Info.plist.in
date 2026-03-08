@@ -5,13 +5,17 @@
     <key>CFBundleDevelopmentRegion</key>
     <string>zh_CN</string>
     <key>CFBundleExecutable</key>
-    <string>ImgcompressNative</string>
+    <string>@APP_EXECUTABLE@</string>
     <key>CFBundleIdentifier</key>
-    <string>com.imgcompress.native</string>
+    <string>@APP_BUNDLE_ID@</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>Imgcompress Native</string>
+    <string>@APP_NAME@</string>
+    <key>CFBundleDisplayName</key>
+    <string>@APP_NAME@</string>
+    <key>CFBundleIconFile</key>
+    <string>@APP_ICON_FILE@</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>

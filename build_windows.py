@@ -14,6 +14,8 @@ def run_command(command: list[str], cwd: Path, env: dict[str, str] | None = None
         text=True,
         bufsize=1,
         universal_newlines=True,
+        encoding="utf-8",
+        errors="replace",
         env=env,
     )
     stdout = process.stdout

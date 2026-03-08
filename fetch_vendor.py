@@ -29,6 +29,12 @@ TOOLS = {
             {"npm_package": "pngquant-bin", "mirror_name": "pngquant-bin"},
         ],
     },
+    "oxipng": {
+        "binary_names": ["oxipng"],
+        "sources": [
+            {"npm_package": "oxipng-bin", "mirror_name": "oxipng-bin"},
+        ],
+    },
     "optipng": {
         "binary_names": ["optipng"],
         "sources": [
@@ -59,13 +65,14 @@ TOOLS = {
             {"npm_package": "cwebp-bin", "mirror_name": "cwebp-bin"},
         ],
     },
-    "dwebp": {
-        "binary_names": ["dwebp"],
-        "sources": [
-            {"npm_package": "cwebp-bin", "mirror_name": "cwebp-bin"},
-            {"npm_package": "cwebp", "mirror_name": "webp"},
-        ],
-    },
+    #获取不到,注释掉
+    # "dwebp": {
+    #     "binary_names": ["dwebp"],
+    #     "sources": [
+    #         {"npm_package": "cwebp-bin", "mirror_name": "cwebp-bin"},
+    #         {"npm_package": "cwebp", "mirror_name": "webp"},
+    #     ],
+    # },
 }
 
 
@@ -156,7 +163,7 @@ def main() -> None:
 
 def parse_args(args: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("tools", nargs="*", help="pngquant optipng cjpeg jpegtran gifsicle cwebp")
+    parser.add_argument("tools", nargs="*", help="pngquant oxipng optipng cjpeg jpegtran gifsicle cwebp")
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--platforms", default="")
     parser.add_argument("--archs", default="")

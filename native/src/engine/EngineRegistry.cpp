@@ -8,8 +8,12 @@
 #include <QProcess>
 #include <QSysInfo>
 #include <QTemporaryFile>
+#include <QScopedPointer>
+#include <QCryptographicHash>
+#include <QImageReader>
 
 namespace {
+const int kProcessTimeoutMs = 180000;
 QString normalizeProfile(const QString &profile) {
     if (profile.contains("强")) {
         return "strong";
@@ -71,6 +75,29 @@ int adjustColors(const QString &profile, int colors) {
     return colors;
 }
 
+QString normalizeSuffix(const QString &suffix) {
+    if (suffix == "jpeg") {
+        return "jpg";
+    }
+    return suffix;
+}
+
+bool isSameFormat(const QString &outputFormat, const QString &suffix) {
+    return outputFormat.isEmpty() || outputFormat == "original" || outputFormat == suffix;
+}
+
+bool isCorruptedInput(const QString &output) {
+    const QString text = output.toLower();
+    return text.contains("corrupt")
+        || text.contains("corrupted")
+        || text.contains("premature end")
+        || text.contains("invalid")
+        || text.contains("bad huffman")
+        || text.contains("unexpected end")
+        || text.contains("read error")
+        || text.contains("missing");
+}
+
 QString detectPlatform() {
     const QString product = QSysInfo::productType().toLower();
     if (product == "osx" || product == "macos" || product == "darwin") {
@@ -99,7 +126,7 @@ QString detectArch() {
 QStringList collectVendorBases(const QDir &startDir, const QString &platformKey, const QString &archKey) {
     QStringList bases;
     QDir current = startDir;
-    for (int depth = 0; depth < 5; ++depth) {
+    for (int depth = 0; depth < 8; ++depth) {
         const QString vendorRoot = current.filePath("vendor");
         if (QDir(vendorRoot).exists()) {
             bases << vendorRoot
@@ -157,8 +184,54 @@ bool runProcess(const QString &program, const QStringList &args) {
     process.setArguments(args);
     process.setProcessChannelMode(QProcess::MergedChannels);
     process.start();
-    process.waitForFinished(-1);
+    if (!process.waitForFinished(kProcessTimeoutMs)) {
+        process.kill();
+        process.waitForFinished(2000);
+        return false;
+    }
     return process.exitStatus() == QProcess::NormalExit && process.exitCode() == 0;
+}
+
+QPair<bool, QString> runProcessWithOutput(const QString &program, const QStringList &args) {
+    QProcess process;
+    process.setProgram(program);
+    process.setArguments(args);
+    process.setProcessChannelMode(QProcess::MergedChannels);
+    process.start();
+    bool finished = process.waitForFinished(kProcessTimeoutMs);
+    if (!finished) {
+        process.kill();
+        process.waitForFinished(2000);
+    }
+    const bool ok = process.exitStatus() == QProcess::NormalExit && process.exitCode() == 0;
+    const QString output = QString::fromUtf8(process.readAllStandardOutput());
+    return qMakePair(ok, output);
+}
+
+QPair<int, QString> runProcessWithCode(const QString &program, const QStringList &args) {
+    QProcess process;
+    process.setProgram(program);
+    process.setArguments(args);
+    process.setProcessChannelMode(QProcess::MergedChannels);
+    process.start();
+    int code = -1;
+    if (process.waitForFinished(kProcessTimeoutMs)) {
+        code = process.exitStatus() == QProcess::NormalExit ? process.exitCode() : -1;
+    } else {
+        process.kill();
+        process.waitForFinished(2000);
+        code = -2;
+    }
+    const QString output = QString::fromUtf8(process.readAllStandardOutput());
+    return qMakePair(code, output);
+}
+
+CompressionResult keepOriginal(const QString &source, const QString &output, const QString &message) {
+    QFile::remove(output);
+    QFile::copy(source, output);
+    const qint64 originalSize = QFileInfo(source).size();
+    const qint64 outputSize = QFileInfo(output).size();
+    return {true, originalSize, outputSize, "原图", message};
 }
 
 CompressionResult copyOriginal(const QString &source, const QString &output) {
@@ -177,6 +250,10 @@ CompressionResult missingEngine(const QString &source, const QString &engine) {
 
 QStringList EngineRegistry::availableEngines() {
     return {"jpegtran", "mozjpeg", "pngquant", "oxipng", "optipng", "gifsicle", "cwebp", "dwebp"};
+}
+
+bool EngineRegistry::toolExists(const QString &name) {
+    return !findTool({name}).isEmpty();
 }
 
 QString EngineRegistry::engineStatus(bool lossless) {
@@ -219,9 +296,12 @@ CompressionResult EngineRegistry::compressFile(
     const QString &output,
     const CompressionOptions &options
 ) {
-    const QString suffix = QFileInfo(source).suffix().toLower();
+    const QString suffixFromName = normalizeSuffix(QFileInfo(source).suffix().toLower());
+    const QByteArray detected = QImageReader::imageFormat(source);
+    const QString actualSuffix = normalizeSuffix(QString::fromLatin1(detected).toLower());
+    const QString suffix = actualSuffix.isEmpty() ? suffixFromName : actualSuffix;
     const qint64 originalSize = QFileInfo(source).size();
-    const QString outputFormat = options.outputFormat.toLower();
+    const QString outputFormat = normalizeSuffix(options.outputFormat.toLower());
     if (outputFormat == "gif" && suffix != "gif") {
         return {false, originalSize, originalSize, "gifsicle", "不支持转换为GIF"};
     }
@@ -237,36 +317,65 @@ CompressionResult EngineRegistry::compressFile(
             const int quality = qBound(1, adjustQuality(options.quality, options.profile), 100);
             args = {"-q", QString::number(quality), "-m", "5", "-metadata", "none", source, "-o", output};
         }
-        const bool ok = runProcess(cwebp, args);
+        const auto res = runProcessWithCode(cwebp, args);
+        const bool ok = res.first == 0;
+        if (res.first == -2) {
+            return {false, originalSize, originalSize, "cwebp", "执行超时"};
+        }
         const qint64 outputSize = QFileInfo(output).size();
+        if (!ok && isSameFormat(outputFormat, suffix) && isCorruptedInput(res.second)) {
+            return keepOriginal(source, output, "源文件异常，已保留原图");
+        }
         return {ok, originalSize, outputSize, "cwebp", ok ? "成功" : "失败"};
     }
-    if (suffix == "webp" && (outputFormat == "jpg" || outputFormat == "jpeg" || outputFormat == "png")) {
+    if (suffix == "webp" && (outputFormat == "jpg" || outputFormat == "png")) {
         const QString dwebp = findTool({"dwebp"});
         if (dwebp.isEmpty()) {
             return {false, originalSize, originalSize, "dwebp", "不支持：缺少 dwebp"};
         }
         if (outputFormat == "png") {
             const QStringList args = {"-quiet", "-png", source, "-o", output};
-            const bool ok = runProcess(dwebp, args);
+            const auto res = runProcessWithCode(dwebp, args);
+            const bool ok = res.first == 0;
+            if (res.first == -2) {
+                return {false, originalSize, originalSize, "dwebp", "执行超时"};
+            }
             const qint64 outputSize = QFileInfo(output).size();
-            return {ok, originalSize, outputSize, "dwebp", ok ? "成功" : "失败"};
+            QString msg = ok ? "成功" : "失败";
+            if (!ok) {
+                const QString tail = res.second.trimmed();
+                if (!tail.isEmpty()) {
+                    msg = tail;
+                }
+            }
+            return {ok, originalSize, outputSize, "dwebp", msg};
         }
         const QString cjpeg = findTool({"cjpeg", "mozjpeg"});
         if (cjpeg.isEmpty()) {
             return missingEngine(source, "mozjpeg");
         }
-        QTemporaryFile temp(QDir(QFileInfo(output).absolutePath()).filePath(".imgcompress_tmp_XXXXXX.ppm"));
-        temp.setAutoRemove(true);
-        if (!temp.open()) {
-            return {false, originalSize, originalSize, "dwebp", "无法创建临时文件"};
+        QScopedPointer<QTemporaryFile> temp(new QTemporaryFile(QDir(QFileInfo(output).absolutePath()).filePath(".imgcompress_tmp_XXXXXX.ppm")));
+        temp->setAutoRemove(true);
+        if (!temp->open()) {
+            temp.reset(new QTemporaryFile(QDir(QDir::tempPath()).filePath("imgcompress_tmp_XXXXXX.ppm")));
+            temp->setAutoRemove(true);
+            if (!temp->open()) {
+                return {false, originalSize, originalSize, "dwebp", "无法创建临时文件"};
+            }
         }
-        const QString tempPath = temp.fileName();
-        temp.close();
+        const QString tempPath = temp->fileName();
+        temp->close();
         const QStringList decodeArgs = {"-quiet", "-ppm", source, "-o", tempPath};
-        const bool decoded = runProcess(dwebp, decodeArgs);
-        if (!decoded) {
-            return {false, originalSize, originalSize, "dwebp", "解码失败"};
+        const auto decoded = runProcessWithCode(dwebp, decodeArgs);
+        if (decoded.first == -2) {
+            return {false, originalSize, originalSize, "dwebp", "执行超时"};
+        }
+        if (decoded.first != 0) {
+            QString msg = decoded.second.trimmed();
+            if (msg.isEmpty()) {
+                msg = "解码失败";
+            }
+            return {false, originalSize, originalSize, "dwebp", msg};
         }
         const int quality = options.lossless ? 100 : qBound(1, adjustQuality(options.quality, options.profile), 100);
         const QStringList encodeArgs = {
@@ -278,27 +387,93 @@ CompressionResult EngineRegistry::compressFile(
             output,
             tempPath
         };
-        const bool ok = runProcess(cjpeg, encodeArgs);
+        const auto res = runProcessWithCode(cjpeg, encodeArgs);
+        const bool ok = res.first == 0;
         const qint64 outputSize = QFileInfo(output).size();
-        return {ok, originalSize, outputSize, "dwebp+mozjpeg", ok ? "成功" : "失败"};
+        if (res.first == -2) {
+            return {false, originalSize, outputSize, "dwebp+mozjpeg", "执行超时"};
+        }
+        QString msg = ok ? "成功" : "失败";
+        if (!ok) {
+            const QString tail = res.second.trimmed();
+            if (!tail.isEmpty()) {
+                msg = tail;
+            }
+        }
+        return {ok, originalSize, outputSize, "dwebp+mozjpeg", msg};
     }
-    if (suffix == "jpg" || suffix == "jpeg") {
+    if (suffix == "jpg") {
         if (options.lossless) {
             const QString jpegtran = findTool({"jpegtran"});
             if (jpegtran.isEmpty()) {
                 return missingEngine(source, "jpegtran");
             }
-            const QStringList args = {
-                "-copy",
-                "none",
-                "-optimize",
-                "-progressive",
-                "-outfile",
-                output,
-                source
-            };
-            const bool ok = runProcess(jpegtran, args);
+            QStringList args = {"-copy", "none", "-optimize", "-progressive"};
+            if (detectPlatform() == "windows") {
+                args << "-trim";
+            }
+            args << "-outfile" << output << source;
+            const auto res = runProcessWithCode(jpegtran, args);
+            const bool ok = res.first == 0;
             const qint64 outputSize = QFileInfo(output).size();
+            if (res.first == -2) {
+                if (isSameFormat(outputFormat, suffix)) {
+                    return keepOriginal(source, output, "jpegtran 超时，已保留原图");
+                }
+                return {false, originalSize, outputSize, "jpegtran", "执行超时"};
+            }
+            if (!ok && isSameFormat(outputFormat, suffix) && isCorruptedInput(res.second)) {
+                return keepOriginal(source, output, "源文件异常，已保留原图");
+            }
+            if (ok && outputSize >= originalSize) {
+                if (detectPlatform() == "windows") {
+                    const QString jpegoptim = findTool({"jpegoptim"});
+                    if (!jpegoptim.isEmpty()) {
+                        const QStringList optArgs = {"--strip-all", "--all-progressive", output};
+                        const auto optRes = runProcessWithCode(jpegoptim, optArgs);
+                        if (optRes.first == 0) {
+                            const qint64 newSize = QFileInfo(output).size();
+                            if (newSize < outputSize) {
+                                return {true, originalSize, newSize, "jpegoptim", "成功（Windows兜底）"};
+                            }
+                        }
+                    }
+                }
+                QFile srcFile(source);
+                QFile outFile(output);
+                QByteArray srcHash;
+                QByteArray outHash;
+                if (srcFile.open(QIODevice::ReadOnly)) {
+                    QCryptographicHash h(QCryptographicHash::Sha1);
+                    while (!srcFile.atEnd()) {
+                        h.addData(srcFile.read(1 << 16));
+                    }
+                    srcHash = h.result();
+                    srcFile.close();
+                }
+                if (outFile.open(QIODevice::ReadOnly)) {
+                    QCryptographicHash h(QCryptographicHash::Sha1);
+                    while (!outFile.atEnd()) {
+                        h.addData(outFile.read(1 << 16));
+                    }
+                    outHash = h.result();
+                    outFile.close();
+                }
+                const QString tail = res.second.trimmed();
+                if (!srcHash.isEmpty() && !outHash.isEmpty() && srcHash == outHash) {
+                    QString msg = "无损无收益（图像未变化）";
+                    if (!tail.isEmpty()) {
+                        msg = QString("%1：%2").arg(msg, tail);
+                    }
+                    return {true, originalSize, outputSize, "jpegtran", msg};
+                } else {
+                    QString msg = "已优化但无体积收益";
+                    if (!tail.isEmpty()) {
+                        msg = QString("%1：%2").arg(msg, tail);
+                    }
+                    return {true, originalSize, outputSize, "jpegtran", msg};
+                }
+            }
             return {ok, originalSize, outputSize, "jpegtran", ok ? "成功" : "失败"};
         }
         const QString cjpeg = findTool({"cjpeg", "mozjpeg"});
@@ -315,8 +490,18 @@ CompressionResult EngineRegistry::compressFile(
             output,
             source
         };
-        const bool ok = runProcess(cjpeg, args);
+        const auto res = runProcessWithCode(cjpeg, args);
+        const bool ok = res.first == 0;
         const qint64 outputSize = QFileInfo(output).size();
+        if (res.first == -2) {
+            if (isSameFormat(outputFormat, suffix)) {
+                return keepOriginal(source, output, "mozjpeg 超时，已保留原图");
+            }
+            return {false, originalSize, outputSize, "mozjpeg", "执行超时"};
+        }
+        if (!ok && isSameFormat(outputFormat, suffix) && isCorruptedInput(res.second)) {
+            return keepOriginal(source, output, "源文件异常，已保留原图");
+        }
         return {ok, originalSize, outputSize, "mozjpeg", ok ? "成功" : "失败"};
     }
     if (suffix == "png") {
@@ -332,53 +517,158 @@ CompressionResult EngineRegistry::compressFile(
                     QString::number(settings.second),
                     "--strip",
                     "--skip-if-larger",
-                    "--output",
-                    output,
+                    "--output", output,
                     "--force",
                     source
                 };
-                const bool ok = runProcess(pngquant, args);
+                const auto res = runProcessWithCode(pngquant, args);
+                const bool ok = res.first == 0;
                 const qint64 outputSize = QFileInfo(output).size();
+                if (res.first == -2) {
+                    if (isSameFormat(outputFormat, suffix)) {
+                        return keepOriginal(source, output, "pngquant 超时，已保留原图");
+                    }
+                    return {false, originalSize, outputSize, "pngquant", "执行超时"};
+                }
                 if (ok) {
                     return {true, originalSize, outputSize, "pngquant", "成功"};
                 }
+                if (res.first == 99) {
+                    QFile::remove(output);
+                    QFile::copy(source, output);
+                    const qint64 copiedSize = QFileInfo(output).size();
+                    return {true, originalSize, copiedSize, "原图", "pngquant 无收益，保留原图"};
+                }
+                if (isSameFormat(outputFormat, suffix) && isCorruptedInput(res.second)) {
+                    return keepOriginal(source, output, "源文件异常，已保留原图");
+                }
             }
         }
-        const QString optimizer = findTool({"oxipng", "optipng"});
-        if (optimizer.isEmpty()) {
-            return missingEngine(source, "oxipng/optipng");
+        if (!options.lossless) {
+            return {false, originalSize, originalSize, "pngquant", "pngquant 无收益，已保留原图"};
         }
+        QString optimizer = findTool({"oxipng"});
         QStringList args;
         const QString normalized = normalizeProfile(options.profile);
-        if (optimizer.contains("oxipng")) {
-            const QString level = normalized == "strong" ? "6" : (normalized == "balanced" ? "5" : "4");
-            args = {"-o", level, "--strip", "all", "-out", output, source};
-        } else {
-            const QString level = normalized == "strong" ? "6" : (normalized == "balanced" ? "6" : "5");
-            args = {QString("-o%1").arg(level), "-strip", "all", "-out", output, source};
+        if (!optimizer.isEmpty()) {
+                const QString level = normalized == "strong" ? "3" : (normalized == "balanced" ? "2" : "1");
+                if (source == output) {
+                    args = {"-o", level, "--strip", "safe", source};
+                } else {
+                    args = {"-o", level, "--strip", "safe", "--out", output, source};
+                }
+            const auto res = runProcessWithCode(optimizer, args);
+            const bool ok = res.first == 0;
+            const qint64 outputSize = QFileInfo(output).size();
+            if (res.first == -2) {
+                if (isSameFormat(outputFormat, suffix)) {
+                    return keepOriginal(source, output, "oxipng 超时，已保留原图");
+                }
+                return {false, originalSize, outputSize, "oxipng", "执行超时"};
+            }
+            if (!ok && isSameFormat(outputFormat, suffix) && isCorruptedInput(res.second)) {
+                return keepOriginal(source, output, "源文件异常，已保留原图");
+            }
+            if (ok) {
+                return {true, originalSize, outputSize, "oxipng", "成功"};
+            }
         }
-        const bool ok = runProcess(optimizer, args);
-        const qint64 outputSize = QFileInfo(output).size();
-        return {ok, originalSize, outputSize, optimizer.contains("oxipng") ? "oxipng" : "optipng", ok ? "成功" : "失败"};
+        if (detectPlatform() == "windows") {
+            optimizer = findTool({"optipng"});
+            if (!optimizer.isEmpty()) {
+                    if (source == output) {
+                        args = {"-o7", "-strip", "all", source};
+                    } else {
+                        args = {"-o7", "-strip", "all", "-out", output, source};
+                    }
+                const auto res = runProcessWithCode(optimizer, args);
+                const bool ok = res.first == 0;
+                const qint64 outputSize = QFileInfo(output).size();
+                if (res.first == -2) {
+                    if (isSameFormat(outputFormat, suffix)) {
+                        return keepOriginal(source, output, "optipng 超时，已保留原图");
+                    }
+                    return {false, originalSize, outputSize, "optipng", "执行超时"};
+                }
+                if (!ok && isSameFormat(outputFormat, suffix) && isCorruptedInput(res.second)) {
+                    return keepOriginal(source, output, "源文件异常，已保留原图");
+                }
+                return {ok, originalSize, outputSize, "optipng", ok ? "成功" : "失败"};
+            }
+        }
+        return missingEngine(source, "oxipng/optipng");
     }
     if (suffix == "gif") {
         const QString gifsicle = findTool({"gifsicle"});
         if (gifsicle.isEmpty()) {
             return missingEngine(source, "gifsicle");
         }
-        QStringList args = {"-O3", "--no-comments", "--no-names", "--no-extensions"};
-        if (!options.lossless) {
+        const QStringList baseArgs = {"-O3", "--no-comments", "--no-names", "--no-extensions"};
+        QStringList args = baseArgs;
+        const bool useLossy = !options.lossless;
+        int lossy = 0;
+        int colors = 0;
+        if (useLossy) {
             const int quality = qBound(1, adjustQuality(options.quality, options.profile), 100);
-            int lossy = qMax(0, static_cast<int>((100 - quality) * 2));
+            lossy = qMax(0, static_cast<int>((100 - quality) * 2));
             lossy = adjustLossy(options.profile, lossy);
-            int colors = qMax(32, static_cast<int>(256 * quality / 100));
+            colors = qMax(32, static_cast<int>(256 * quality / 100));
             colors = adjustColors(options.profile, colors);
-            args << "--lossy" << QString::number(lossy) << "--colors" << QString::number(colors);
+            args << QString("--lossy=%1").arg(lossy) << QString("--colors=%1").arg(colors);
         }
         args << source << "-o" << output;
-        const bool ok = runProcess(gifsicle, args);
-        const qint64 outputSize = QFileInfo(output).size();
-        return {ok, originalSize, outputSize, "gifsicle", ok ? "成功" : "失败"};
+        auto res = runProcessWithOutput(gifsicle, args);
+        bool ok = res.first;
+        bool usedLossy = useLossy;
+        if (!ok && useLossy) {
+            QStringList retryArgs = baseArgs;
+            retryArgs << source << "-o" << output;
+            res = runProcessWithOutput(gifsicle, retryArgs);
+            ok = res.first;
+            usedLossy = false;
+        }
+        qint64 outputSize = QFileInfo(output).size();
+        if (ok && usedLossy && outputSize >= originalSize) {
+            const int retryLossy = qMin(200, static_cast<int>(lossy * 1.3) + 5);
+            const int retryColors = qMax(32, static_cast<int>(colors * 0.8));
+            QScopedPointer<QTemporaryFile> temp(new QTemporaryFile(QDir(QFileInfo(output).absolutePath()).filePath(".imgcompress_gif_XXXXXX.gif")));
+            temp->setAutoRemove(true);
+            bool opened = temp->open();
+            if (!opened) {
+                temp.reset(new QTemporaryFile(QDir(QDir::tempPath()).filePath("imgcompress_gif_XXXXXX.gif")));
+                temp->setAutoRemove(true);
+                opened = temp->open();
+            }
+            if (opened) {
+                const QString tempPath = temp->fileName();
+                temp->close();
+                QStringList retryArgs = baseArgs;
+                retryArgs << QString("--lossy=%1").arg(retryLossy) << QString("--colors=%1").arg(retryColors);
+                retryArgs << source << "-o" << tempPath;
+                const auto retryRes = runProcessWithOutput(gifsicle, retryArgs);
+                if (retryRes.first) {
+                    const qint64 retrySize = QFileInfo(tempPath).size();
+                    if (retrySize > 0 && retrySize < outputSize) {
+                        QFile::remove(output);
+                        QFile::copy(tempPath, output);
+                        outputSize = retrySize;
+                        res = retryRes;
+                        ok = true;
+                    }
+                }
+            }
+        }
+        if (!ok && isSameFormat(outputFormat, suffix) && isCorruptedInput(res.second)) {
+            return keepOriginal(source, output, "源文件异常，已保留原图");
+        }
+        QString msg = ok ? "成功" : "失败";
+        if (!ok) {
+            QString tail = res.second.trimmed();
+            if (!tail.isEmpty()) {
+                msg = tail;
+            }
+        }
+        return {ok, originalSize, outputSize, "gifsicle", msg};
     }
     if (suffix == "webp") {
         const QString cwebp = findTool({"cwebp"});
@@ -392,9 +682,26 @@ CompressionResult EngineRegistry::compressFile(
             const int quality = qBound(1, adjustQuality(options.quality, options.profile), 100);
             args = {"-q", QString::number(quality), "-m", "5", "-metadata", "none", source, "-o", output};
         }
-        const bool ok = runProcess(cwebp, args);
+        const auto res = runProcessWithCode(cwebp, args);
+        const bool ok = res.first == 0;
         const qint64 outputSize = QFileInfo(output).size();
-        return {ok, originalSize, outputSize, "cwebp", ok ? "成功" : "失败"};
+        if (!ok) {
+            const QString tail = res.second.trimmed();
+            const bool noOutput = !QFileInfo::exists(output);
+            if (res.first == -2) {
+                if (isSameFormat(outputFormat, suffix)) {
+                    return keepOriginal(source, output, "cwebp 超时，已保留原图");
+                }
+                return {false, originalSize, outputSize, "cwebp", "执行超时"};
+            }
+            if (isSameFormat(outputFormat, suffix) && (isCorruptedInput(tail) || noOutput)) {
+                const QString msg = tail.isEmpty() ? "cwebp 失败，已保留原图" : QString("cwebp 失败，已保留原图：%1").arg(tail);
+                return keepOriginal(source, output, msg);
+            }
+            const QString msg = tail.isEmpty() ? "失败" : tail;
+            return {false, originalSize, outputSize, "cwebp", msg};
+        }
+        return {true, originalSize, outputSize, "cwebp", "成功"};
     }
     return {false, originalSize, originalSize, "无", "不支持的格式"};
 }

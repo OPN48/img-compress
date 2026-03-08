@@ -66,10 +66,6 @@ def resolve_qtpaths(env: dict[str, str]) -> str:
     candidates = [
         shutil.which("qtpaths"),
         shutil.which("qtpaths6"),
-        "/opt/homebrew/opt/qt/bin/qtpaths",
-        "/opt/homebrew/opt/qt/bin/qtpaths6",
-        "/usr/local/opt/qt/bin/qtpaths",
-        "/usr/local/opt/qt/bin/qtpaths6",
     ]
     for item in candidates:
         if item and Path(item).exists():

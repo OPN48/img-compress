@@ -1,0 +1,10 @@
+{
+  "CMAKE_EXE": "/Users/weiwei/Qt/Tools/CMake/CMake.app/Contents/bin/cmake",
+  "QT_PREFIX": "/Users/weiwei/Qt/6.10.2/macos",
+  "QT_PATHS": "/Users/weiwei/Qt/6.10.2/macos/bin/qtpaths",
+  "MACDEPLOYQT_EXE": "/Users/weiwei/Qt/6.10.2/macos/bin/macdeployqt",
+  "SPLIT_ARCH_PACKAGES": true,
+  "CMAKE_OSX_SYSROOT": "macosx",
+  "CMAKE_OSX_DEPLOYMENT_TARGET": "13.0",
+  "CMAKE_OSX_ARCHITECTURES": "arm64;x86_64"
+}
