@@ -5,6 +5,7 @@ import io
 import json
 import os
 import platform
+import re
 import shutil
 import stat
 import sys
@@ -572,6 +573,65 @@ def rewrite_macos_install_names(path: Path, lib_dir: Path) -> None:
         )
 
 
+def parse_otool_rpaths(path: Path) -> list[str]:
+    try:
+        out = subprocess.check_output(["otool", "-l", str(path)], text=True)
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    rpaths: list[str] = []
+    lines = out.splitlines()
+    for i, line in enumerate(lines):
+        if "LC_RPATH" not in line:
+            continue
+        for j in range(i + 1, min(i + 6, len(lines))):
+            m = re.search(r"path\s+(\S+)\s+\(offset", lines[j])
+            if m:
+                rpaths.append(m.group(1))
+                break
+    return rpaths
+
+
+def normalize_macos_rpaths(path: Path, *, dylib: bool) -> None:
+    """Ensure sibling-resolvable rpaths; drop Homebrew absolute rpaths."""
+    install_name_tool = shutil.which("install_name_tool")
+    if not install_name_tool:
+        return
+    try:
+        path.chmod(path.stat().st_mode | stat.S_IWUSR)
+    except OSError:
+        pass
+    wanted = "@loader_path" if dylib else "@loader_path/../lib"
+    existing = parse_otool_rpaths(path)
+    for rp in existing:
+        if rp.startswith("/opt/homebrew") or rp.startswith("/usr/local/Cellar") or rp.startswith(
+            "/usr/local/opt"
+        ):
+            try:
+                subprocess.check_call(
+                    [install_name_tool, "-delete_rpath", rp, str(path)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except subprocess.CalledProcessError:
+                pass
+    if wanted not in parse_otool_rpaths(path):
+        try:
+            subprocess.check_call(
+                [install_name_tool, "-add_rpath", wanted, str(path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except subprocess.CalledProcessError:
+            pass
+    codesign = shutil.which("codesign")
+    if codesign:
+        subprocess.call(
+            [codesign, "--force", "-s", "-", str(path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
 def copy_macos_loader_libs(binary: Path, vendor_macos_dir: Path) -> None:
     """Copy @rpath and non-system absolute dylibs into vendor/macos/lib.
 
@@ -622,32 +682,9 @@ def copy_macos_loader_libs(binary: Path, vendor_macos_dir: Path) -> None:
     for name in sorted(copied_names):
         rewrite_macos_install_names(lib_dir / name, lib_dir)
 
-    # Ensure @loader_path/../lib rpath exists on the binary.
-    try:
-        out = subprocess.check_output(["otool", "-l", str(binary)], text=True)
-    except (OSError, subprocess.CalledProcessError):
-        return
-    if "@loader_path/../lib" in out:
-        return
-    install_name_tool = shutil.which("install_name_tool")
-    if not install_name_tool:
-        return
-    try:
-        binary.chmod(binary.stat().st_mode | stat.S_IWUSR)
-        subprocess.check_call(
-            [install_name_tool, "-add_rpath", "@loader_path/../lib", str(binary)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return
-    codesign = shutil.which("codesign")
-    if codesign:
-        subprocess.call(
-            [codesign, "--force", "-s", "-", str(binary)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+    normalize_macos_rpaths(binary, dylib=False)
+    for name in sorted(copied_names):
+        normalize_macos_rpaths(lib_dir / name, dylib=True)
 
 
 def copy_from_system_for_arch(

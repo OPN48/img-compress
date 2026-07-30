@@ -326,6 +326,23 @@ def thin_app_to_arch(app_path: Path, arch: str) -> None:
             print(f"  - {item}")
 
 
+def clear_bundled_vendor(app_path: Path) -> None:
+    """Remove prior vendor binaries before macdeployqt.
+
+    Incremental builds reuse the .app bundle; leftover Resources/vendor tools
+    (dwebp/cwebp + libtiff deps) use @rpath that macdeployqt cannot resolve
+    against Qt's lib, producing ERROR: Cannot resolve rpath lines.
+    """
+    vendor_dst = app_path / "Contents" / "Resources" / "vendor"
+    if vendor_dst.exists():
+        shutil.rmtree(vendor_dst)
+        print("已清除上次打包的 vendor（避免 macdeployqt 误扫 @rpath）")
+
+
+def _vendor_copy_ignore(_dir: str, names: list[str]) -> set[str]:
+    return {name for name in names if name.endswith(".bak") or name.startswith(".")}
+
+
 def deploy_vendor(app_path: Path, repo_dir: Path, arch: str) -> None:
     resources_dir = app_path / "Contents" / "Resources"
     resources_dir.mkdir(parents=True, exist_ok=True)
@@ -339,13 +356,13 @@ def deploy_vendor(app_path: Path, repo_dir: Path, arch: str) -> None:
         return
     target = vendor_dst / "macos" / vendor_key
     target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(vendor_src, target)
+    shutil.copytree(vendor_src, target, ignore=_vendor_copy_ignore)
     print(f"已打包 vendor/macos/{vendor_key}")
-    # cjpeg/jpegtran use @loader_path/../lib (vendor/macos/lib)
+    # cjpeg/jpegtran / cwebp/dwebp use @loader_path/../lib (vendor/macos/lib)
     lib_src = repo_dir / "vendor" / "macos" / "lib"
     if lib_src.is_dir():
         lib_dst = vendor_dst / "macos" / "lib"
-        shutil.copytree(lib_src, lib_dst)
+        shutil.copytree(lib_src, lib_dst, ignore=_vendor_copy_ignore)
         print("已打包 vendor/macos/lib")
 
 
@@ -473,6 +490,8 @@ def package_for_arch(
     run_command(build_cmake_args(root_dir, build_dir, arch_settings), root_dir, env)
     run_command([str(arch_settings["cmake"]), "--build", str(build_dir), "--config", "Release"], root_dir, env)
     app_path = resolve_app(build_dir, app_executable)
+    # Vendor must not be present when macdeployqt scans the bundle.
+    clear_bundled_vendor(app_path)
     run_command([str(arch_settings["macdeployqt"]), str(app_path), "-no-plugins"], root_dir, env)
     deploy_qt_plugins(app_path, env, cfg, arch_settings["qt_prefix"])
     deploy_vendor(app_path, repo_dir, arch)
