@@ -28,6 +28,7 @@ class EngineRegistry {
 public:
     static QStringList availableEngines();
     static bool toolExists(const QString &name);
+    static QString resolveTool(const QStringList &names);
     static QString engineStatus(bool lossless);
     static CompressionResult compressFile(
         const QString &source,

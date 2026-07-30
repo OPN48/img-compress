@@ -262,15 +262,108 @@ def deploy_qt_plugins(app_path: Path, env: dict[str, str], cfg: dict, qt_prefix:
     copy_plugin_files(plugin_dir, app_path, "styles", ["libqmacstyle.dylib"])
 
 
-def deploy_vendor(app_path: Path, repo_dir: Path) -> None:
+def vendor_arch_key(cmake_arch: str) -> str:
+    if cmake_arch == "x86_64":
+        return "x64"
+    return cmake_arch
+
+
+def lipo_arches(path: Path) -> list[str]:
+    try:
+        output = subprocess.check_output(["lipo", "-archs", str(path)], text=True, stderr=subprocess.DEVNULL).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    return [item for item in output.split() if item]
+
+
+def thin_file_to_arch(path: Path, arch: str) -> str:
+    arches = lipo_arches(path)
+    if not arches:
+        return "skip"
+    if arches == [arch]:
+        return "ok"
+    if arch in arches:
+        temp_path = path.with_name(path.name + ".thin_tmp")
+        subprocess.check_call(
+            ["lipo", "-thin", arch, str(path), "-output", str(temp_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        temp_path.replace(path)
+        return "thinned"
+    return "incompatible"
+
+
+def thin_app_to_arch(app_path: Path, arch: str) -> None:
+    removed: list[str] = []
+    thinned = 0
+    for path in list(iter_macho_files(app_path)):
+        result = thin_file_to_arch(path, arch)
+        if result == "thinned":
+            thinned += 1
+        elif result == "incompatible":
+            try:
+                path.unlink()
+                removed.append(str(path.relative_to(app_path)))
+            except OSError:
+                removed.append(str(path))
+    # Also thin framework binaries skipped by iter_macho_files.
+    frameworks_dir = app_path / "Contents" / "Frameworks"
+    if frameworks_dir.exists():
+        for framework in frameworks_dir.glob("*.framework"):
+            binary = framework / "Versions" / "Current" / framework.stem
+            if binary.exists() and is_macho_file(binary):
+                result = thin_file_to_arch(binary, arch)
+                if result == "thinned":
+                    thinned += 1
+                elif result == "incompatible":
+                    raise SystemExit(f"主框架架构不匹配，无法生成 {arch} 包：{binary}")
+    if thinned:
+        print(f"已剥离非 {arch} 架构切片：{thinned} 个文件")
+    if removed:
+        print(f"已从 {arch} 包移除不兼容二进制（{len(removed)}）：")
+        for item in removed:
+            print(f"  - {item}")
+
+
+def clear_bundled_vendor(app_path: Path) -> None:
+    """Remove prior vendor binaries before macdeployqt.
+
+    Incremental builds reuse the .app bundle; leftover Resources/vendor tools
+    (dwebp/cwebp + libtiff deps) use @rpath that macdeployqt cannot resolve
+    against Qt's lib, producing ERROR: Cannot resolve rpath lines.
+    """
+    vendor_dst = app_path / "Contents" / "Resources" / "vendor"
+    if vendor_dst.exists():
+        shutil.rmtree(vendor_dst)
+        print("已清除上次打包的 vendor（避免 macdeployqt 误扫 @rpath）")
+
+
+def _vendor_copy_ignore(_dir: str, names: list[str]) -> set[str]:
+    return {name for name in names if name.endswith(".bak") or name.startswith(".")}
+
+
+def deploy_vendor(app_path: Path, repo_dir: Path, arch: str) -> None:
     resources_dir = app_path / "Contents" / "Resources"
     resources_dir.mkdir(parents=True, exist_ok=True)
-    vendor_src = repo_dir / "vendor"
+    vendor_key = vendor_arch_key(arch)
+    vendor_src = repo_dir / "vendor" / "macos" / vendor_key
     vendor_dst = resources_dir / "vendor"
-    if vendor_src.is_dir():
-        if vendor_dst.exists():
-            shutil.rmtree(vendor_dst)
-        shutil.copytree(vendor_src, vendor_dst)
+    if vendor_dst.exists():
+        shutil.rmtree(vendor_dst)
+    if not vendor_src.is_dir():
+        print(f"警告：未找到 vendor/macos/{vendor_key}，跳过引擎打包")
+        return
+    target = vendor_dst / "macos" / vendor_key
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(vendor_src, target, ignore=_vendor_copy_ignore)
+    print(f"已打包 vendor/macos/{vendor_key}")
+    # cjpeg/jpegtran / cwebp/dwebp use @loader_path/../lib (vendor/macos/lib)
+    lib_src = repo_dir / "vendor" / "macos" / "lib"
+    if lib_src.is_dir():
+        lib_dst = vendor_dst / "macos" / "lib"
+        shutil.copytree(lib_src, lib_dst, ignore=_vendor_copy_ignore)
+        print("已打包 vendor/macos/lib")
 
 
 def has_framework_info(framework_path: Path) -> bool:
@@ -397,9 +490,12 @@ def package_for_arch(
     run_command(build_cmake_args(root_dir, build_dir, arch_settings), root_dir, env)
     run_command([str(arch_settings["cmake"]), "--build", str(build_dir), "--config", "Release"], root_dir, env)
     app_path = resolve_app(build_dir, app_executable)
+    # Vendor must not be present when macdeployqt scans the bundle.
+    clear_bundled_vendor(app_path)
     run_command([str(arch_settings["macdeployqt"]), str(app_path), "-no-plugins"], root_dir, env)
     deploy_qt_plugins(app_path, env, cfg, arch_settings["qt_prefix"])
-    deploy_vendor(app_path, repo_dir)
+    deploy_vendor(app_path, repo_dir, arch)
+    thin_app_to_arch(app_path, arch)
     output_dir = dist_dir / arch if split_output else dist_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     dist_app = output_dir / f"{app_executable}.app"
