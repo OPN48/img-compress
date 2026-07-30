@@ -160,7 +160,8 @@ ConvertResult convertFromWebpToPngCli(const QString &sourcePath, const QString &
     if (dwebp.isEmpty()) {
         return {false, QStringLiteral("缺少 dwebp"), QStringLiteral("dwebp")};
     }
-    if (!runTool(dwebp, {"-quiet", "-png", sourcePath, "-o", destPath})) {
+    // libwebp dwebp defaults to PNG; there is no -png flag.
+    if (!runTool(dwebp, {"-quiet", sourcePath, "-o", destPath})) {
         return {false, QStringLiteral("dwebp 转换失败"), QStringLiteral("dwebp")};
     }
     return {true, QStringLiteral("已转换（中间文件）"), QStringLiteral("dwebp")};

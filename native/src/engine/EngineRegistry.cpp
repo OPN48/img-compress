@@ -469,7 +469,13 @@ CompressionResult EngineRegistry::compressFile(
                 }
                 const auto res = runProcessWithCode(oxipng, args);
                 if (res.first == 0) {
-                    return {true, originalSize, QFileInfo(output).size(), "oxipng", "成功"};
+                    return {
+                        true,
+                        originalSize,
+                        QFileInfo(output).size(),
+                        "oxipng",
+                        "有损未缩小，已做无损优化"
+                    };
                 }
                 if (res.first == -2) {
                     if (isSameFormat(outputFormat, suffix)) {

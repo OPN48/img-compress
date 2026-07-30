@@ -38,7 +38,8 @@
    - PNG：最大化 zlib/滤波组合（按强度选择滤波策略与压缩级别），结合哈夫曼表优化  
    - PNG：quality 影响质量区间，区间与 speed 联动（压缩率与速度平衡）  
    - GIF：轻度抖动与色彩收敛控制，减少色带与块状噪点  
-   - 调色与色板：以可见色为基准进行颜色聚类与量化，兼顾体积与视觉一致性  
+   - 调色与色板：PNG 有损由 **pngquant** 按图中可见色做色板量化（非独立「可见色」模块）；GIF 由 gifsicle `--colors` 减色  
+   - WebP 解码：**dwebp** 随 App 打包（构建机可从本机 brew webp 拷贝），用户无需安装 Homebrew  
    - GIF：lossy 值与 colors 上限联动（清晰度与体积权衡）  
    - GIF：有损输出未减小体积时，会自动提高 lossy/降低 colors 再尝试一次  
    - PNG：pngquant 在体积无收益时会跳过输出  

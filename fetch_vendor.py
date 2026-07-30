@@ -77,14 +77,13 @@ TOOLS = {
             {"npm_package": "cwebp-bin", "mirror_name": "cwebp-bin"},
         ],
     },
-    #获取不到,注释掉
-    # "dwebp": {
-    #     "binary_names": ["dwebp"],
-    #     "sources": [
-    #         {"npm_package": "cwebp-bin", "mirror_name": "cwebp-bin"},
-    #         {"npm_package": "cwebp", "mirror_name": "webp"},
-    #     ],
-    # },
+    # npm 无 macOS arm64 预编译；本机用 brew webp 拷贝 + copy_macos_loader_libs 打进包
+    "dwebp": {
+        "binary_names": ["dwebp"],
+        "sources": [
+            {"npm_package": "dwebp-bin", "mirror_name": "dwebp-bin"},
+        ],
+    },
 }
 
 
@@ -106,7 +105,11 @@ def main() -> None:
                 source_label = "GitHub" if payload is not None else ""
                 if payload is None:
                     if name not in npm_cache:
-                        npm_cache[name] = load_npm_sources(tool)
+                        try:
+                            npm_cache[name] = load_npm_sources(tool)
+                        except Exception as exc:
+                            print(f"{name} npm 源不可用，将尝试本机拷贝：{exc}")
+                            npm_cache[name] = []
                     sources = npm_cache[name]
                     for candidate_arch in arch_candidates(platform_key, arch_key):
                         for source in sources:
@@ -146,7 +149,7 @@ def main() -> None:
                         arch_key,
                     )
                     if copied:
-                        print(f"{name} -> {copied}")
+                        print(f"{name} -> {copied}（本机）")
                         continue
                 if payload is None:
                     missing.append(f"{name} ({platform_key}/{arch_key})")
@@ -244,7 +247,7 @@ def normalize_macos_binary(path: Path, arch_key: str) -> bool:
 
 def parse_args(args: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("tools", nargs="*", help="pngquant oxipng optipng cjpeg jpegtran gifsicle cwebp")
+    parser.add_argument("tools", nargs="*", help="pngquant oxipng optipng cjpeg jpegtran gifsicle cwebp dwebp")
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--platforms", default="")
     parser.add_argument("--archs", default="")
@@ -435,6 +438,14 @@ MACOS_PREFERRED_TOOL_PATHS: dict[str, list[str]] = {
     "jpegtran": [
         "/opt/homebrew/opt/mozjpeg/bin/jpegtran",
         "/usr/local/opt/mozjpeg/bin/jpegtran",
+    ],
+    "dwebp": [
+        "/opt/homebrew/opt/webp/bin/dwebp",
+        "/usr/local/opt/webp/bin/dwebp",
+    ],
+    "cwebp": [
+        "/opt/homebrew/opt/webp/bin/cwebp",
+        "/usr/local/opt/webp/bin/cwebp",
     ],
 }
 
