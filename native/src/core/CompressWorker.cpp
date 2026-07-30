@@ -61,21 +61,21 @@ QString normalizeSuffix(const QString &suffix) {
 }
 
 // Prefer system temp (more reliable on Windows), then fall back to output dir.
-QScopedPointer<QTemporaryFile> createWorkTemp(const QString &suffix, const QDir &outputRoot) {
+// QScopedPointer is not movable in Qt 6; fill via out-parameter.
+bool createWorkTemp(QScopedPointer<QTemporaryFile> &temp, const QString &suffix, const QDir &outputRoot) {
     const QString pattern = QString("imgcompress_tmp_XXXXXX.%1").arg(suffix);
-    QScopedPointer<QTemporaryFile> temp(
-        new QTemporaryFile(QDir(QDir::tempPath()).filePath(pattern))
-    );
+    temp.reset(new QTemporaryFile(QDir(QDir::tempPath()).filePath(pattern)));
     temp->setAutoRemove(true);
     if (temp->open()) {
-        return temp;
+        return true;
     }
     temp.reset(new QTemporaryFile(outputRoot.filePath(pattern)));
     temp->setAutoRemove(true);
     if (temp->open()) {
-        return temp;
+        return true;
     }
-    return {};
+    temp.reset();
+    return false;
 }
 
 struct TaskOutcome {
@@ -157,8 +157,8 @@ TaskOutcome compressSingle(
                 return outcome;
             }
             const QString tempFormat = !actualSuffix.isEmpty() ? actualSuffix : "png";
-            QScopedPointer<QTemporaryFile> temp = createWorkTemp(tempFormat, outputRoot);
-            if (temp.isNull()) {
+            QScopedPointer<QTemporaryFile> temp;
+            if (!createWorkTemp(temp, tempFormat, outputRoot)) {
                 outcome.logs << QString("%1 转换失败：无法创建临时文件").arg(sourceInfo.fileName());
                 outcome.hasResult = false;
                 return outcome;
@@ -186,8 +186,8 @@ TaskOutcome compressSingle(
         }
     } else if (options.resizeEnabled || targetFormat != effectiveSuffix || formatMismatch) {
         if (!options.resizeEnabled && formatMismatch && targetFormat == effectiveSuffix) {
-            QScopedPointer<QTemporaryFile> temp = createWorkTemp(effectiveSuffix, outputRoot);
-            if (temp.isNull()) {
+            QScopedPointer<QTemporaryFile> temp;
+            if (!createWorkTemp(temp, effectiveSuffix, outputRoot)) {
                 QImageReader reader(file);
                 reader.setAutoTransform(true);
                 if (!actualSuffix.isEmpty()) {
@@ -271,8 +271,8 @@ TaskOutcome compressSingle(
             if (convertToWebp || convertToGif) {
                 tempFormat = effectiveSuffix.isEmpty() ? "png" : effectiveSuffix;
             }
-            QScopedPointer<QTemporaryFile> temp = createWorkTemp(tempFormat, outputRoot);
-            if (temp.isNull()) {
+            QScopedPointer<QTemporaryFile> temp;
+            if (!createWorkTemp(temp, tempFormat, outputRoot)) {
                 outcome.logs << QString("%1 转换失败：无法创建临时文件").arg(sourceInfo.fileName());
                 outcome.hasResult = false;
                 return outcome;
