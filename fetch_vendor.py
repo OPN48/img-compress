@@ -426,17 +426,217 @@ def ensure_executable(path: Path, platform_key: str) -> None:
     path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
+# Prefer Homebrew mozjpeg over PATH cjpeg/jpegtran (often libjpeg-turbo).
+MACOS_PREFERRED_TOOL_PATHS: dict[str, list[str]] = {
+    "cjpeg": [
+        "/opt/homebrew/opt/mozjpeg/bin/cjpeg",
+        "/usr/local/opt/mozjpeg/bin/cjpeg",
+    ],
+    "jpegtran": [
+        "/opt/homebrew/opt/mozjpeg/bin/jpegtran",
+        "/usr/local/opt/mozjpeg/bin/jpegtran",
+    ],
+}
+
+
+def resolve_system_tool_path(name: str) -> Path | None:
+    preferred = MACOS_PREFERRED_TOOL_PATHS.get(name, [])
+    for candidate in preferred:
+        path = Path(candidate)
+        if path.is_file():
+            return path
+    system_path = shutil.which(name)
+    if system_path:
+        return Path(system_path)
+    return None
+
+
 def copy_from_system(names: list[str], target_dir: Path, platform_key: str) -> Path | None:
     for name in names:
-        system_path = shutil.which(name)
-        if not system_path:
+        source = resolve_system_tool_path(name)
+        if source is None:
             continue
-        source = Path(system_path)
         target = target_dir / output_name(source.name, platform_key)
         write_bytes(target, source.read_bytes())
         ensure_executable(target, platform_key)
         return target
     return None
+
+
+def is_macos_system_dylib(dep: str) -> bool:
+    return (
+        dep.startswith("/usr/lib/")
+        or dep.startswith("/System/")
+        or dep.startswith("/Library/Apple/")
+    )
+
+
+def parse_otool_deps(binary: Path) -> list[str]:
+    try:
+        out = subprocess.check_output(["otool", "-L", str(binary)], text=True)
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    deps: list[str] = []
+    for line in out.splitlines()[1:]:
+        dep = line.strip().split(" ", 1)[0]
+        if dep and not dep.endswith(":"):
+            deps.append(dep)
+    return deps
+
+
+def macos_dylib_search_paths(name: str, binary: Path) -> list[Path]:
+    homebrew_roots = [Path("/opt/homebrew/opt"), Path("/usr/local/opt")]
+    candidates: list[Path] = []
+    for root in homebrew_roots:
+        if root.is_dir():
+            for opt_lib in sorted(root.glob("*/lib")):
+                candidates.append(opt_lib / name)
+        candidates.extend(
+            [
+                root.parent / "lib" / name,
+                Path("/opt/homebrew/lib") / name,
+                Path("/usr/local/lib") / name,
+            ]
+        )
+    parent = binary.resolve().parent
+    candidates.extend(
+        [
+            parent / name,
+            parent / "lib" / name,
+            parent.parent / "lib" / name,
+        ]
+    )
+    return candidates
+
+
+def find_macos_dylib(name: str, binary: Path) -> Path | None:
+    for src in macos_dylib_search_paths(name, binary):
+        if src.is_file():
+            return src.resolve()
+    return None
+
+
+def rewrite_macos_install_names(path: Path, lib_dir: Path) -> None:
+    """Point non-system absolute / @rpath deps at @rpath/<basename> when vendored."""
+    install_name_tool = shutil.which("install_name_tool")
+    if not install_name_tool:
+        return
+    try:
+        path.chmod(path.stat().st_mode | stat.S_IWUSR)
+    except OSError:
+        pass
+    if path.suffix == ".dylib":
+        try:
+            subprocess.check_call(
+                [install_name_tool, "-id", f"@rpath/{path.name}", str(path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except subprocess.CalledProcessError:
+            pass
+    for dep in parse_otool_deps(path):
+        if dep.startswith("@") and not dep.startswith("@rpath/"):
+            continue
+        if is_macos_system_dylib(dep):
+            continue
+        name = Path(dep).name
+        if not (lib_dir / name).is_file():
+            continue
+        if dep == f"@rpath/{name}":
+            continue
+        try:
+            subprocess.check_call(
+                [install_name_tool, "-change", dep, f"@rpath/{name}", str(path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except subprocess.CalledProcessError:
+            continue
+    codesign = shutil.which("codesign")
+    if codesign:
+        subprocess.call(
+            [codesign, "--force", "-s", "-", str(path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+def copy_macos_loader_libs(binary: Path, vendor_macos_dir: Path) -> None:
+    """Copy @rpath and non-system absolute dylibs into vendor/macos/lib.
+
+    Also copies transitive deps and rewrites install names to @rpath so binaries
+    run with @loader_path/../lib without DYLD_LIBRARY_PATH / Homebrew.
+    """
+    lib_dir = vendor_macos_dir / "lib"
+    pending = [binary.resolve()]
+    seen_bins: set[Path] = set()
+    copied_names: set[str] = set()
+
+    while pending:
+        current = pending.pop()
+        if current in seen_bins:
+            continue
+        seen_bins.add(current)
+        for dep in parse_otool_deps(current):
+            if is_macos_system_dylib(dep):
+                continue
+            # Vendor @rpath and absolute non-system deps; skip other @ paths.
+            if dep.startswith("@rpath/"):
+                pass
+            elif dep.startswith("@"):
+                continue
+            elif not dep.startswith("/"):
+                continue
+            name = Path(dep).name
+            if not name.endswith(".dylib"):
+                continue
+            dest = lib_dir / name
+            if name not in copied_names:
+                src = find_macos_dylib(name, binary)
+                if src is None and dep.startswith("/") and Path(dep).is_file():
+                    src = Path(dep).resolve()
+                if src is None:
+                    print(f"warn: missing dylib for {dep}")
+                    continue
+                lib_dir.mkdir(parents=True, exist_ok=True)
+                write_bytes(dest, src.read_bytes())
+                print(f"lib -> {dest}")
+                copied_names.add(name)
+                pending.append(dest)
+            if dest.is_file() and dest not in seen_bins:
+                pending.append(dest)
+
+    # Rewrite binary + all vendored libs to use @rpath names.
+    rewrite_macos_install_names(binary, lib_dir)
+    for name in sorted(copied_names):
+        rewrite_macos_install_names(lib_dir / name, lib_dir)
+
+    # Ensure @loader_path/../lib rpath exists on the binary.
+    try:
+        out = subprocess.check_output(["otool", "-l", str(binary)], text=True)
+    except (OSError, subprocess.CalledProcessError):
+        return
+    if "@loader_path/../lib" in out:
+        return
+    install_name_tool = shutil.which("install_name_tool")
+    if not install_name_tool:
+        return
+    try:
+        binary.chmod(binary.stat().st_mode | stat.S_IWUSR)
+        subprocess.check_call(
+            [install_name_tool, "-add_rpath", "@loader_path/../lib", str(binary)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return
+    codesign = shutil.which("codesign")
+    if codesign:
+        subprocess.call(
+            [codesign, "--force", "-s", "-", str(binary)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
 
 def copy_from_system_for_arch(
@@ -448,6 +648,9 @@ def copy_from_system_for_arch(
     if platform_key == "macos" and not normalize_macos_binary(copied, arch_key):
         copied.unlink(missing_ok=True)
         return None
+    if platform_key == "macos":
+        # target_dir is vendor/macos/<arch>
+        copy_macos_loader_libs(copied, target_dir.parent)
     return copied
 
 

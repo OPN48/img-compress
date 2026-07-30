@@ -341,6 +341,12 @@ def deploy_vendor(app_path: Path, repo_dir: Path, arch: str) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(vendor_src, target)
     print(f"已打包 vendor/macos/{vendor_key}")
+    # cjpeg/jpegtran use @loader_path/../lib (vendor/macos/lib)
+    lib_src = repo_dir / "vendor" / "macos" / "lib"
+    if lib_src.is_dir():
+        lib_dst = vendor_dst / "macos" / "lib"
+        shutil.copytree(lib_src, lib_dst)
+        print("已打包 vendor/macos/lib")
 
 
 def has_framework_info(framework_path: Path) -> bool:

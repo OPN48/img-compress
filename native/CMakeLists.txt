@@ -32,6 +32,16 @@ set(APP_SOURCES
     src/core/CompressController.cpp
     src/core/CompressWorker.h
     src/core/CompressWorker.cpp
+    src/core/CompressPipeline.h
+    src/core/CompressPipeline.cpp
+    src/core/FormatDetector.h
+    src/core/FormatDetector.cpp
+    src/core/ImageConverter.h
+    src/core/ImageConverter.cpp
+    src/core/MozJpegEncoder.h
+    src/core/MozJpegEncoder.cpp
+    src/core/WorkTemp.h
+    src/core/WorkTemp.cpp
     src/engine/EngineRegistry.h
     src/engine/EngineRegistry.cpp
 )

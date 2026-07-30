@@ -137,3 +137,12 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
+
+# Local smoke / conversion test assets (do not commit)
+testdata/
+.pngquant_test*/
+native/build_*/_e2e/
+native/build_*/_audit/
+native/build_*/_ratio_test/
+native/build_*/_webp/
+*.turbo.bak

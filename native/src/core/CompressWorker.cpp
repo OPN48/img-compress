@@ -1,83 +1,23 @@
 #include "CompressWorker.h"
 
+#include "CompressPipeline.h"
+
 #include <QDateTime>
 #include <QDir>
 #include <QDirIterator>
-#include <QFile>
 #include <QFileInfo>
-#include <QImage>
-#include <QImageReader>
-#include <QImageWriter>
 #include <QHash>
 #include <QMutex>
 #include <QMutexLocker>
 #include <QSet>
 #include <QThread>
 #include <QThreadPool>
-#include <QTemporaryFile>
-#include <QScopedPointer>
 #include <QVector>
 #include <QWaitCondition>
 #include <QQueue>
 #include <algorithm>
 
 namespace {
-QString ensureUniquePath(const QString &candidate, const QString &sourcePath, const QString &stem, const QString &suffix) {
-    const QFileInfo candidateInfo(candidate);
-    const QFileInfo sourceInfo(sourcePath);
-    const QString candidatePath = candidateInfo.absoluteFilePath();
-    const QString sourceAbsPath = sourceInfo.absoluteFilePath();
-    if (candidatePath != sourceAbsPath && !QFileInfo::exists(candidatePath)) {
-        return candidatePath;
-    }
-    const QString ext = suffix.isEmpty() ? QString() : "." + suffix;
-    QDir dir = candidateInfo.dir();
-    int index = 1;
-    while (true) {
-        const QString name = QString("%1(%2)%3").arg(stem).arg(index).arg(ext);
-        const QString nextPath = dir.filePath(name);
-        if (!QFileInfo::exists(nextPath) && nextPath != sourceAbsPath) {
-            return nextPath;
-        }
-        index += 1;
-    }
-}
-
-int adjustQuality(int quality, const QString &profile) {
-    if (profile.contains("强")) {
-        return qMax(8, quality - 18);
-    }
-    if (profile.contains("均衡")) {
-        return qMax(10, quality - 10);
-    }
-    return quality;
-}
-
-QString normalizeSuffix(const QString &suffix) {
-    if (suffix == "jpeg") {
-        return "jpg";
-    }
-    return suffix;
-}
-
-// Prefer system temp (more reliable on Windows), then fall back to output dir.
-// QScopedPointer is not movable in Qt 6; fill via out-parameter.
-bool createWorkTemp(QScopedPointer<QTemporaryFile> &temp, const QString &suffix, const QDir &outputRoot) {
-    const QString pattern = QString("imgcompress_tmp_XXXXXX.%1").arg(suffix);
-    temp.reset(new QTemporaryFile(QDir(QDir::tempPath()).filePath(pattern)));
-    temp->setAutoRemove(true);
-    if (temp->open()) {
-        return true;
-    }
-    temp.reset(new QTemporaryFile(outputRoot.filePath(pattern)));
-    temp->setAutoRemove(true);
-    if (temp->open()) {
-        return true;
-    }
-    temp.reset();
-    return false;
-}
-
 struct TaskOutcome {
     QString fileName;
     QString filePath;
@@ -86,227 +26,6 @@ struct TaskOutcome {
     QStringList logs;
     qint64 elapsedMs;
 };
-
-TaskOutcome compressSingle(
-    const QString &file,
-    const QDir &inputRoot,
-    const QDir &outputRoot,
-    const CompressionOptions &options
-) {
-    TaskOutcome outcome;
-    const QFileInfo sourceInfo(file);
-    outcome.fileName = sourceInfo.fileName();
-    outcome.filePath = sourceInfo.absoluteFilePath();
-    const QString relativePath = inputRoot.relativeFilePath(file);
-    const QFileInfo relativeInfo(relativePath);
-    const QString sourceSuffix = normalizeSuffix(sourceInfo.suffix().toLower());
-    const QByteArray detectedFormat = QImageReader::imageFormat(file);
-    const QString actualSuffix = normalizeSuffix(QString::fromLatin1(detectedFormat).toLower());
-    const bool formatMismatch = !actualSuffix.isEmpty() && actualSuffix != sourceSuffix;
-    const QString effectiveSuffix = actualSuffix.isEmpty() ? sourceSuffix : actualSuffix;
-    if (formatMismatch) {
-        outcome.logs << QString("%1 实际格式为 %2，与扩展名 %3 不一致，将按实际格式输出并压缩")
-                            .arg(sourceInfo.fileName())
-                            .arg(actualSuffix)
-                            .arg(sourceSuffix);
-    }
-    const QString rawOutputFormat = options.outputFormat.toLower();
-    const QString normalizedOutputFormat = normalizeSuffix(rawOutputFormat);
-    const QString targetFormat = rawOutputFormat.isEmpty() || rawOutputFormat == "original"
-        ? effectiveSuffix
-        : normalizedOutputFormat;
-    const QString baseName = sourceInfo.completeBaseName();
-    const QString relativeDir = relativeInfo.path();
-    const QString outputFileName = targetFormat.isEmpty() ? baseName : baseName + "." + targetFormat;
-    QString outputPath = relativeDir == "."
-        ? outputRoot.filePath(outputFileName)
-        : outputRoot.filePath(relativeDir + "/" + outputFileName);
-    outputPath = ensureUniquePath(outputPath, sourceInfo.absoluteFilePath(), baseName, targetFormat);
-    QFileInfo outputInfo(outputPath);
-    QDir outputDirInfo = outputInfo.dir();
-    if (!outputDirInfo.exists()) {
-        outputDirInfo.mkpath(".");
-    }
-    const qint64 sourceSize = sourceInfo.size();
-    outcome.result = {false, sourceSize, sourceSize, "无", "失败"};
-    outcome.hasResult = true;
-    const bool convertToWebp = targetFormat == "webp" && effectiveSuffix != "webp";
-    const bool convertToGif = targetFormat == "gif" && effectiveSuffix != "gif";
-    const bool convertFromWebp = effectiveSuffix == "webp"
-        && (targetFormat == "jpg" || targetFormat == "png");
-    if (convertToGif) {
-        outcome.logs << QString("%1 转换失败：不支持转换为GIF").arg(sourceInfo.fileName());
-        outcome.hasResult = false;
-        return outcome;
-    }
-    if (options.resizeEnabled && (effectiveSuffix == "webp" || targetFormat == "webp")) {
-        outcome.logs << QString("%1 转换失败：启用尺寸裁剪/缩放时不支持 WebP（需要 Qt WebP 插件）").arg(sourceInfo.fileName());
-        outcome.hasResult = false;
-        return outcome;
-    }
-    if ((convertToWebp || convertFromWebp) && !options.resizeEnabled) {
-        outcome.result = EngineRegistry::compressFile(file, outputPath, options);
-        if (!outcome.result.success) {
-            QImageReader reader(file);
-            reader.setAutoTransform(true);
-            if (!actualSuffix.isEmpty()) {
-                reader.setFormat(actualSuffix.toLatin1());
-            }
-            QImage image = reader.read();
-            if (image.isNull()) {
-                return outcome;
-            }
-            const QString tempFormat = !actualSuffix.isEmpty() ? actualSuffix : "png";
-            QScopedPointer<QTemporaryFile> temp;
-            if (!createWorkTemp(temp, tempFormat, outputRoot)) {
-                outcome.logs << QString("%1 转换失败：无法创建临时文件").arg(sourceInfo.fileName());
-                outcome.hasResult = false;
-                return outcome;
-            }
-            const QString tempPath = temp->fileName();
-            temp->close();
-            QImageWriter writer(tempPath, tempFormat.toLatin1());
-            const int quality = options.lossless
-                ? 100
-                : qBound(1, adjustQuality(options.quality, options.profile), 100);
-            writer.setQuality(quality);
-            if (!writer.write(image)) {
-                outcome.logs << QString("%1 转换失败：无法写入格式").arg(sourceInfo.fileName());
-                outcome.hasResult = false;
-                return outcome;
-            }
-            outcome.result = EngineRegistry::compressFile(tempPath, outputPath, options);
-            outcome.result.originalSize = sourceSize;
-            if (outcome.result.success) {
-                outcome.result.outputSize = QFileInfo(outputPath).size();
-            }
-        } else {
-            outcome.result.originalSize = sourceSize;
-            outcome.result.outputSize = QFileInfo(outputPath).size();
-        }
-    } else if (options.resizeEnabled || targetFormat != effectiveSuffix || formatMismatch) {
-        if (!options.resizeEnabled && formatMismatch && targetFormat == effectiveSuffix) {
-            QScopedPointer<QTemporaryFile> temp;
-            if (!createWorkTemp(temp, effectiveSuffix, outputRoot)) {
-                QImageReader reader(file);
-                reader.setAutoTransform(true);
-                if (!actualSuffix.isEmpty()) {
-                    reader.setFormat(actualSuffix.toLatin1());
-                }
-                QImage image = reader.read();
-                if (image.isNull()) {
-                    outcome.logs << QString("%1 转换失败：无法读取图片").arg(sourceInfo.fileName());
-                    outcome.hasResult = false;
-                    return outcome;
-                }
-                QImageWriter writer(outputPath, effectiveSuffix.toLatin1());
-                const int quality = options.lossless
-                    ? 100
-                    : qBound(1, adjustQuality(options.quality, options.profile), 100);
-                writer.setQuality(quality);
-                if (!writer.write(image)) {
-                    outcome.logs << QString("%1 转换失败：无法写入格式").arg(sourceInfo.fileName());
-                    outcome.hasResult = false;
-                    return outcome;
-                }
-                outcome.result = {true, sourceSize, QFileInfo(outputPath).size(), "Qt", "已按实际格式输出"};
-                return outcome;
-            }
-            const QString tempPath = temp->fileName();
-            temp->close();
-            QFile::remove(tempPath);
-            if (!QFile::copy(file, tempPath)) {
-                outcome.logs << QString("%1 转换失败：无法创建临时文件").arg(sourceInfo.fileName());
-                outcome.hasResult = false;
-                return outcome;
-            }
-            outcome.result = EngineRegistry::compressFile(tempPath, outputPath, options);
-            if (!outcome.result.success) {
-                QFile::remove(outputPath);
-                QFile::copy(file, outputPath);
-                outcome.result = {true, sourceSize, QFileInfo(outputPath).size(), "原图", "已按实际格式输出"};
-            } else {
-                outcome.result.originalSize = sourceSize;
-                outcome.result.outputSize = QFileInfo(outputPath).size();
-            }
-        } else {
-            QImageReader reader(file);
-            reader.setAutoTransform(true);
-            if (effectiveSuffix == "webp") {
-                reader.setFormat("webp");
-            }
-            QImage image = reader.read();
-            if (image.isNull()) {
-                if (effectiveSuffix == "webp") {
-                    outcome.logs << QString("%1 转换失败：WebP 解码不可用（缺少 dwebp 或 Qt WebP 插件）").arg(sourceInfo.fileName());
-                } else {
-                    outcome.logs << QString("%1 转换失败：无法读取图片").arg(sourceInfo.fileName());
-                }
-                outcome.hasResult = false;
-                return outcome;
-            }
-            if (options.resizeEnabled) {
-                if (options.resizeMode == 2) {
-                    image = image.scaled(
-                        options.targetWidth,
-                        options.targetHeight,
-                        Qt::KeepAspectRatioByExpanding,
-                        Qt::SmoothTransformation
-                    );
-                    const int cropWidth = qMin(options.targetWidth, image.width());
-                    const int cropHeight = qMin(options.targetHeight, image.height());
-                    const int offsetX = qMax(0, (image.width() - cropWidth) / 2);
-                    const int offsetY = qMax(0, (image.height() - cropHeight) / 2);
-                    image = image.copy(QRect(offsetX, offsetY, cropWidth, cropHeight));
-                } else if (options.resizeMode == 1) {
-                    image = image.scaled(
-                        options.targetWidth,
-                        options.targetHeight,
-                        Qt::KeepAspectRatio,
-                        Qt::SmoothTransformation
-                    );
-                }
-            }
-            QString tempFormat = targetFormat;
-            if (convertToWebp || convertToGif) {
-                tempFormat = effectiveSuffix.isEmpty() ? "png" : effectiveSuffix;
-            }
-            QScopedPointer<QTemporaryFile> temp;
-            if (!createWorkTemp(temp, tempFormat, outputRoot)) {
-                outcome.logs << QString("%1 转换失败：无法创建临时文件").arg(sourceInfo.fileName());
-                outcome.hasResult = false;
-                return outcome;
-            }
-            const QString tempPath = temp->fileName();
-            temp->close();
-            QImageWriter writer(tempPath, tempFormat.toLatin1());
-            const int quality = options.lossless
-                ? 100
-                : qBound(1, adjustQuality(options.quality, options.profile), 100);
-            writer.setQuality(quality);
-            if (!writer.write(image)) {
-                outcome.logs << QString("%1 转换失败：无法写入格式").arg(sourceInfo.fileName());
-                outcome.hasResult = false;
-                return outcome;
-            }
-            outcome.result = EngineRegistry::compressFile(tempPath, outputPath, options);
-            outcome.result.originalSize = sourceSize;
-            if (outcome.result.success) {
-                outcome.result.outputSize = QFileInfo(outputPath).size();
-            }
-        }
-    } else {
-        outcome.result = EngineRegistry::compressFile(file, outputPath, options);
-    }
-    if (outcome.result.success && outcome.result.outputSize > outcome.result.originalSize) {
-        QFile::remove(outputPath);
-        QFile::copy(sourceInfo.absoluteFilePath(), outputPath);
-        outcome.result.outputSize = QFileInfo(outputPath).size();
-        outcome.result.engine = "原图";
-        outcome.result.message = "已保留原图";
-    }
-    return outcome;
-}
 
 class CompressTask final : public QRunnable {
 public:
@@ -331,8 +50,13 @@ public:
 
     void run() override {
         const QDateTime started = QDateTime::currentDateTime();
-        const TaskOutcome outcome = compressSingle(filePath, input, output, opts);
-        TaskOutcome finished = outcome;
+        const PipelineOutcome pipeline = CompressPipeline::run(filePath, input, output, opts);
+        TaskOutcome finished;
+        finished.fileName = pipeline.fileName;
+        finished.filePath = pipeline.filePath;
+        finished.result = pipeline.result;
+        finished.hasResult = pipeline.hasResult;
+        finished.logs = pipeline.logs;
         finished.elapsedMs = started.msecsTo(QDateTime::currentDateTime());
         QMutexLocker locker(queueMutex);
         resultQueue->enqueue(finished);
