@@ -354,10 +354,12 @@ CompressionResult EngineRegistry::compressFile(
         if (cjpeg.isEmpty()) {
             return missingEngine(source, "mozjpeg");
         }
-        QScopedPointer<QTemporaryFile> temp(new QTemporaryFile(QDir(QFileInfo(output).absolutePath()).filePath(".imgcompress_tmp_XXXXXX.ppm")));
+        QScopedPointer<QTemporaryFile> temp(
+            new QTemporaryFile(QDir(QDir::tempPath()).filePath("imgcompress_tmp_XXXXXX.ppm"))
+        );
         temp->setAutoRemove(true);
         if (!temp->open()) {
-            temp.reset(new QTemporaryFile(QDir(QDir::tempPath()).filePath("imgcompress_tmp_XXXXXX.ppm")));
+            temp.reset(new QTemporaryFile(QDir(QFileInfo(output).absolutePath()).filePath("imgcompress_tmp_XXXXXX.ppm")));
             temp->setAutoRemove(true);
             if (!temp->open()) {
                 return {false, originalSize, originalSize, "dwebp", "无法创建临时文件"};
@@ -631,11 +633,13 @@ CompressionResult EngineRegistry::compressFile(
         if (ok && usedLossy && outputSize >= originalSize) {
             const int retryLossy = qMin(200, static_cast<int>(lossy * 1.3) + 5);
             const int retryColors = qMax(32, static_cast<int>(colors * 0.8));
-            QScopedPointer<QTemporaryFile> temp(new QTemporaryFile(QDir(QFileInfo(output).absolutePath()).filePath(".imgcompress_gif_XXXXXX.gif")));
+            QScopedPointer<QTemporaryFile> temp(
+                new QTemporaryFile(QDir(QDir::tempPath()).filePath("imgcompress_gif_XXXXXX.gif"))
+            );
             temp->setAutoRemove(true);
             bool opened = temp->open();
             if (!opened) {
-                temp.reset(new QTemporaryFile(QDir(QDir::tempPath()).filePath("imgcompress_gif_XXXXXX.gif")));
+                temp.reset(new QTemporaryFile(QDir(QFileInfo(output).absolutePath()).filePath("imgcompress_gif_XXXXXX.gif")));
                 temp->setAutoRemove(true);
                 opened = temp->open();
             }

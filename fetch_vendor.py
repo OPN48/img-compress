@@ -12,6 +12,7 @@ import tarfile
 from pathlib import Path
 from typing import Iterable, cast
 from urllib.request import Request, urlopen
+import subprocess
 
 
 VENDOR_DIR = Path(__file__).resolve().parent / "vendor"
@@ -34,6 +35,17 @@ TOOLS = {
         "sources": [
             {"npm_package": "oxipng-bin", "mirror_name": "oxipng-bin"},
         ],
+        # npm 的 macos 包只有 x86_64；arm64 / 官方构建走 GitHub Releases
+        "github": {
+            "repo": "oxipng/oxipng",
+            "asset_markers": {
+                "macos/arm64": ["aarch64-apple-darwin"],
+                "macos/x64": ["x86_64-apple-darwin"],
+                "linux/arm64": ["aarch64-unknown-linux-gnu"],
+                "linux/x64": ["x86_64-unknown-linux-gnu"],
+                "windows/x64": ["x86_64-pc-windows-msvc"],
+            },
+        },
     },
     "optipng": {
         "binary_names": ["optipng"],
@@ -82,59 +94,56 @@ def main() -> None:
     current_platform = detect_platform()
     current_arch = detect_arch()
     missing: list[str] = []
+    npm_cache: dict[str, list[dict[str, object]]] = {}
     for name in args.tools:
         tool = TOOLS[name]
-        sources = []
-        for source in cast(list[dict[str, str]], tool["sources"]):
-            package = source["npm_package"]
-            tarball_url, package_version = resolve_npm_tarball(package)
-            tar_bytes = download_bytes(tarball_url)
-            with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tar:
-                version = read_package_version(tar) or package_version
-            sources.append(
-                {
-                    "tar_bytes": tar_bytes,
-                    "version": version,
-                    "mirror_name": source.get("mirror_name", ""),
-                }
-            )
         for platform_key in args.platforms:
             for arch_key in args.archs:
                 target_dir = VENDOR_DIR / platform_key / arch_key
                 target_dir.mkdir(parents=True, exist_ok=True)
                 used_fallback_arch = False
-                payload = None
-                for candidate_arch in arch_candidates(platform_key, arch_key):
-                    for source in sources:
-                        with tarfile.open(
-                            fileobj=io.BytesIO(source["tar_bytes"]), mode="r:gz"
-                        ) as tar:
-                            members = [
-                                m
-                                for m in tar.getmembers()
-                                if (m.isfile() or m.issym()) and "/vendor/" in m.name
-                            ]
-                            payload = fetch_payload_from_sources(
-                                tar,
-                                members,
-                                {
-                                    "binary_names": tool["binary_names"],
-                                    "mirror_name": source["mirror_name"],
-                                },
-                                source["version"],
-                                platform_key,
-                                candidate_arch,
-                            )
+                payload = try_download_from_github(tool, platform_key, arch_key)
+                source_label = "GitHub" if payload is not None else ""
+                if payload is None:
+                    if name not in npm_cache:
+                        npm_cache[name] = load_npm_sources(tool)
+                    sources = npm_cache[name]
+                    for candidate_arch in arch_candidates(platform_key, arch_key):
+                        for source in sources:
+                            tar_bytes = cast(bytes, source["tar_bytes"])
+                            with tarfile.open(
+                                fileobj=io.BytesIO(tar_bytes), mode="r:gz"
+                            ) as tar:
+                                members = [
+                                    m
+                                    for m in tar.getmembers()
+                                    if (m.isfile() or m.issym()) and "/vendor/" in m.name
+                                ]
+                                payload = fetch_payload_from_sources(
+                                    tar,
+                                    members,
+                                    {
+                                        "binary_names": tool["binary_names"],
+                                        "mirror_name": source["mirror_name"],
+                                    },
+                                    cast(str, source["version"]),
+                                    platform_key,
+                                    candidate_arch,
+                                )
+                            if payload is not None:
+                                used_fallback_arch = candidate_arch != arch_key
+                                source_label = "npm"
+                                break
                         if payload is not None:
-                            used_fallback_arch = candidate_arch != arch_key
                             break
-                    if payload is not None:
-                        break
                 if payload is None and is_local_target(
                     platform_key, arch_key, current_platform, current_arch
                 ):
-                    copied = copy_from_system(
-                        cast(list[str], tool["binary_names"]), target_dir, platform_key
+                    copied = copy_from_system_for_arch(
+                        cast(list[str], tool["binary_names"]),
+                        target_dir,
+                        platform_key,
+                        arch_key,
                     )
                     if copied:
                         print(f"{name} -> {copied}")
@@ -152,13 +161,85 @@ def main() -> None:
                 )
                 write_bytes(target, payload)
                 ensure_executable(target, platform_key)
+                if platform_key == "macos" and not normalize_macos_binary(target, arch_key):
+                    target.unlink(missing_ok=True)
+                    missing.append(f"{name} ({platform_key}/{arch_key})")
+                    if not args.allow_missing:
+                        raise RuntimeError(
+                            f"二进制架构不匹配：{name} ({platform_key}/{arch_key})"
+                        )
+                    print(f"{name} 架构不匹配，已跳过：{platform_key}/{arch_key}")
+                    continue
                 if used_fallback_arch:
                     print(f"{name} -> {target}（x64 回退）")
+                elif source_label == "GitHub":
+                    print(f"{name} -> {target}（GitHub）")
                 else:
                     print(f"{name} -> {target}")
     if missing and not args.allow_missing:
         missing_text = "，".join(missing)
         raise RuntimeError(f"未找到可用二进制：{missing_text}")
+
+
+def load_npm_sources(tool: dict[str, object]) -> list[dict[str, object]]:
+    sources: list[dict[str, object]] = []
+    for source in cast(list[dict[str, str]], tool.get("sources") or []):
+        package = source.get("npm_package")
+        if not package:
+            continue
+        tarball_url, package_version = resolve_npm_tarball(package)
+        tar_bytes = download_bytes(tarball_url)
+        with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tar:
+            version = read_package_version(tar) or package_version
+        sources.append(
+            {
+                "tar_bytes": tar_bytes,
+                "version": version,
+                "mirror_name": source.get("mirror_name", ""),
+            }
+        )
+    return sources
+
+
+def expected_macho_arch(arch_key: str) -> str:
+    if arch_key == "x64":
+        return "x86_64"
+    return arch_key
+
+
+def lipo_arches(path: Path) -> list[str]:
+    lipo = shutil.which("lipo")
+    if not lipo:
+        return []
+    try:
+        output = subprocess.check_output(
+            [lipo, "-archs", str(path)], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    return [item for item in output.split() if item]
+
+
+def normalize_macos_binary(path: Path, arch_key: str) -> bool:
+    target_arch = expected_macho_arch(arch_key)
+    arches = lipo_arches(path)
+    if not arches:
+        return True
+    if arches == [target_arch]:
+        return True
+    if target_arch not in arches:
+        return False
+    lipo = shutil.which("lipo")
+    if not lipo:
+        return False
+    temp_path = path.with_name(path.name + ".thin_tmp")
+    subprocess.check_call(
+        [lipo, "-thin", target_arch, str(path), "-output", str(temp_path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    temp_path.replace(path)
+    return True
 
 
 def parse_args(args: list[str]) -> argparse.Namespace:
@@ -358,6 +439,18 @@ def copy_from_system(names: list[str], target_dir: Path, platform_key: str) -> P
     return None
 
 
+def copy_from_system_for_arch(
+    names: list[str], target_dir: Path, platform_key: str, arch_key: str
+) -> Path | None:
+    copied = copy_from_system(names, target_dir, platform_key)
+    if copied is None:
+        return None
+    if platform_key == "macos" and not normalize_macos_binary(copied, arch_key):
+        copied.unlink(missing_ok=True)
+        return None
+    return copied
+
+
 def resolve_npm_tarball(package: str) -> tuple[str, str]:
     url = f"{NPM_REGISTRY}/{package}/latest"
     payload = json_get(url)
@@ -384,13 +477,99 @@ def read_package_version(tar: tarfile.TarFile) -> str:
     return data.get("version", "")
 
 
+def try_download_from_github(
+    tool: dict[str, object],
+    platform_key: str,
+    arch_key: str,
+) -> bytes | None:
+    github = cast("dict[str, object] | None", tool.get("github"))
+    if not github:
+        return None
+    repo = cast("str | None", github.get("repo"))
+    markers_map = cast("dict[str, list[str]] | None", github.get("asset_markers"))
+    if not repo or not markers_map:
+        return None
+    markers = markers_map.get(f"{platform_key}/{arch_key}")
+    if not markers:
+        return None
+    names = cast(list[str], tool["binary_names"])
+    release_urls = [
+        f"https://api.github.com/repos/{repo}/releases/latest",
+        f"https://ghproxy.net/https://api.github.com/repos/{repo}/releases/latest",
+    ]
+    release = None
+    for url in release_urls:
+        try:
+            release = json_get(url)
+            break
+        except Exception:
+            continue
+    if not release:
+        return None
+    assets = cast(list[dict], release.get("assets") or [])
+    asset = None
+    for item in assets:
+        name = str(item.get("name") or "").lower()
+        if all(marker.lower() in name for marker in markers):
+            asset = item
+            break
+    if asset is None:
+        return None
+    download_url = str(asset.get("browser_download_url") or "")
+    if not download_url:
+        return None
+    candidate_urls = [download_url, f"https://ghproxy.net/{download_url}"]
+    archive = None
+    for url in candidate_urls:
+        try:
+            archive = download_bytes(url)
+            break
+        except Exception:
+            continue
+    if archive is None:
+        return None
+    asset_name = str(asset.get("name") or "")
+    return extract_binary_from_archive(archive, asset_name, names)
+
+
+def extract_binary_from_archive(
+    archive: bytes, asset_name: str, names: list[str]
+) -> bytes | None:
+    lower_name = asset_name.lower()
+    if lower_name.endswith(".tar.gz") or lower_name.endswith(".tgz"):
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
+            members = [m for m in tar.getmembers() if m.isfile()]
+            selected = None
+            for member in members:
+                if is_name_match(Path(member.name).name, names):
+                    selected = member
+                    break
+            if selected is None:
+                return None
+            return extract_member_bytes(tar, selected)
+    if lower_name.endswith(".zip"):
+        import zipfile
+
+        with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                if is_name_match(Path(info.filename).name, names):
+                    return zf.read(info.filename)
+        return None
+    # bare binary asset
+    if any(is_name_match(Path(asset_name).name, [name]) for name in names):
+        return archive
+    return None
+
+
 def try_download_from_mirror(
     tool: dict[str, object],
     version: str,
     platform_key: str,
     arch_key: str,
 ) -> bytes | None:
-    mirror_name = cast(str | None, tool.get("mirror_name"))
+    mirror_name = cast("str | None", tool.get("mirror_name"))
     if not mirror_name or not version:
         return None
     base = f"{BINARY_MIRROR}/{mirror_name}/v{version}"
@@ -437,13 +616,13 @@ def try_download_from_mirror(
 
 def download_bytes(url: str) -> bytes:
     request = Request(url, headers={"User-Agent": "imgcompress-fetcher"})
-    with urlopen(request) as response:
+    with urlopen(request, timeout=60) as response:
         return response.read()
 
 
 def json_get(url: str) -> dict:
     request = Request(url, headers={"User-Agent": "imgcompress-fetcher"})
-    with urlopen(request) as response:
+    with urlopen(request, timeout=30) as response:
         payload = response.read().decode("utf-8")
     return json.loads(payload)
 
